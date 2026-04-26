@@ -58,7 +58,7 @@ func (h *Handler) handlePay(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.queue.Enqueue(r.Context(), txn); err != nil {
 		slog.Error("failed to enqueue transaction", "error", err)
-		writeError(w, http.StatusInternalServerError, "could not store transaction")
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -73,7 +73,7 @@ func (h *Handler) handlePay(w http.ResponseWriter, r *http.Request) {
 
 // handleGetTransaction lets the client poll for status
 //
-//	usie polling here but should be using webhook or sockets in a real app
+// i	usie polling here but should be using webhook or sockets in a real app
 func (h *Handler) handleGetTransaction(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -81,21 +81,13 @@ func (h *Handler) handleGetTransaction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	row := h.queue.Pool().QueryRow(r.Context(), `
-		SELECT id, idempotency_key, amount, currency,
-		       sender_ref, recipient_code, status,
-		       attempts, max_attempts, next_retry_at,
-		       last_error, paystack_ref, created_at, updated_at
-		FROM   transactions WHERE id = $1
-	`, id)
-
-	var txn models.Transaction
-	if err := row.Scan(
-		&txn.ID, &txn.IdempotencyKey, &txn.Amount, &txn.Currency,
-		&txn.SenderRef, &txn.RecipientCode, &txn.Status,
-		&txn.Attempts, &txn.MaxAttempts, &txn.NextRetryAt,
-		&txn.LastError, &txn.PaystackRef, &txn.CreatedAt, &txn.UpdatedAt,
-	); err != nil {
+	txn, err := h.queue.GetByID(r.Context(), id)
+	if err != nil {
+		slog.Error("get transaction failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	if txn == nil {
 		writeError(w, http.StatusNotFound, "transaction not found")
 		return
 	}

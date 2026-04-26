@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -33,12 +34,15 @@ func (c *Cache) Get(ctx context.Context, key string) (json.RawMessage, error) {
 	err := c.pool.QueryRow(ctx, `
 	SELECT response_body
 	FROM idempotency_cache
-	WHERE idempotency_KEY = $!
+	WHERE idempotency_KEY = $1
 	AND expires_at > NOW()
 	`, key).Scan(&body)
 
-	if err == pgx.ErrNoRows {
-		return nil, nil //its just a cache miss not an error
+	// if err == pgx.ErrNoRows {
+	// 	return nil, nil //its just a cache miss not an error
+	// }
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("idempotency cache get: %w", err)
@@ -50,7 +54,7 @@ func (c *Cache) Get(ctx context.Context, key string) (json.RawMessage, error) {
 func (c *Cache) Set(ctx context.Context, key string, response json.RawMessage) error {
 	_, err := c.pool.Exec(ctx, `
 	INSERT INTO idempotency_cache (idempotency_key, response_body)
-	VALUES ($!, $2)
+	VALUES ($1, $2)
 	ON CONFLICT (idempotency_key) DO NOTHING
 	`, key, response)
 	if err != nil {
