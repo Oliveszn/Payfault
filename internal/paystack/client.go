@@ -1,30 +1,23 @@
 package paystack
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
+	"math/rand"
+	"sync"
 	"time"
 )
 
-const baseURL = "https://api.paystack.co"
-
 // Every request automatically attaches: Authorization: Bearer and Idempotency-Key
 type Client struct {
-	secretKey  string
-	httpClient *http.Client
+	mu    sync.Mutex
+	store map[string]json.RawMessage //idempotency store
 }
 
 func New() *Client {
 	return &Client{
-		secretKey: os.Getenv("PAYSTACK_SECRET_KEY"),
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		store: make(map[string]json.RawMessage),
 	}
 }
 
@@ -48,67 +41,53 @@ type TransferResponse struct {
 	} `json:"data"`
 }
 
-// InitiateTransfer sends a transfer request to Paystack
-// idempotencyKey is sent as the Idempotency-Key header Paystack returns the original response if theyve seen this key before
-func (c *Client) InitiateTransfer(
-	ctx context.Context,
-	req TransferRequest,
-	idempotencyKey string,
-) (*TransferResponse, json.RawMessage, error) {
+// InitiateTransfer sends a transfer request to our mock api
+// idempotencyKey is sent as the Idempotency-Key header our mock api returns the original response if theyve seen this key before
+func (c *Client) InitiateTransfer(ctx context.Context, req TransferRequest, idempotencyKey string) (*TransferResponse, json.RawMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, nil, fmt.Errorf("marshal transfer request: %w", err)
+	// Idempotency simulation
+	if cached, ok := c.store[idempotencyKey]; ok {
+		var resp TransferResponse
+		_ = json.Unmarshal(cached, &resp)
+		return &resp, cached, nil
 	}
 
-	httpReq, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		baseURL+"/transfer",
-		bytes.NewReader(body),
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("build request: %w", err)
-	}
+	// simulate network delay
+	time.Sleep(time.Duration(rand.Intn(300)) * time.Millisecond)
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.secretKey)
+	// Random outcome simulation
+	r := rand.Float64()
 
-	// This is the idempotency header. paystack stores responses against this key for 24h
-	// If the client retries, paystack returns the same response rather than processing a second transfer
-	httpReq.Header.Set("Idempotency-Key", idempotencyKey)
+	switch {
+	// SUCCESS (60%)
+	case r < 0.6:
+		resp := TransferResponse{
+			Status:  true,
+			Message: "Transfer successful",
+		}
+		resp.Data.Reference = fmt.Sprintf("mock_ref_%d", time.Now().UnixNano())
+		resp.Data.Status = "success"
+		resp.Data.Amount = req.Amount
 
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		// Network level error like a timeout or connection refused
-		// This is safe to retry cos we never reached paystack
-		return nil, nil, fmt.Errorf("http do: %w", err)
-	}
-	defer resp.Body.Close()
+		raw, _ := json.Marshal(resp)
+		c.store[idempotencyKey] = raw
 
-	rawBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, nil, fmt.Errorf("read response body: %w", err)
-	}
+		return &resp, raw, nil
 
-	// 4xx errors are permanent could be bad request or invalid smth
-	// 5xx errors are transient, so safe to retry.
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		return nil, rawBody, &PermanentError{
-			StatusCode: resp.StatusCode,
-			Body:       string(rawBody),
+	//  TRANSIENT ERROR (25%)
+	case r < 0.85:
+		return nil, nil, fmt.Errorf("mock network error: timeout")
+
+	// PERMANENT ERROR (15%)
+	default:
+		body := `{"status":false,"message":"invalid recipient"}`
+		return nil, []byte(body), &PermanentError{
+			StatusCode: 400,
+			Body:       body,
 		}
 	}
-	if resp.StatusCode >= 500 {
-		return nil, rawBody, fmt.Errorf("paystack server error %d: %s", resp.StatusCode, rawBody)
-	}
-
-	var transfer TransferResponse
-	if err := json.Unmarshal(rawBody, &transfer); err != nil {
-		return nil, rawBody, fmt.Errorf("unmarshal transfer response: %w", err)
-	}
-
-	return &transfer, rawBody, nil
 }
 
 // PermanentError signals a 4xx from paystack
@@ -119,5 +98,5 @@ type PermanentError struct {
 }
 
 func (e *PermanentError) Error() string {
-	return fmt.Sprintf("paystack permanent error %d: %s", e.StatusCode, e.Body)
+	return fmt.Sprintf("mock permanent error %d: %s", e.StatusCode, e.Body)
 }
