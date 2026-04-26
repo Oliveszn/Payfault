@@ -2,7 +2,9 @@ package sync
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -177,4 +179,84 @@ func (e *Engine) handleError(
 	if retryErr := e.queue.MarkRetry(ctx, txn.ID.String(), nextAttempt, err.Error()); retryErr != nil {
 		log.Error("mark retry error", "error", retryErr)
 	}
+}
+
+// Test hooks
+// These are only used in tests. They allow the engine's process() method to
+// be driven with fake dependencies injected from outside.
+
+// QueueWriter is the subset of queue.Queue the engine needs to call.
+type QueueWriter interface {
+	MarkProcessing(ctx context.Context, txnID string) error
+	MarkSuccess(ctx context.Context, txnID, ref string) error
+	MarkRetry(ctx context.Context, txnID string, attempts int, lastErr string) error
+	MarkFailed(ctx context.Context, txnID, lastErr string) error
+}
+
+// IdemCache is the subset of idempotency.Cache the engine needs.
+type IdemCache interface {
+	Get(ctx context.Context, key string) (json.RawMessage, error)
+	Set(ctx context.Context, key string, response json.RawMessage) error
+}
+
+// TransferFn is a function that performs a transfer and returns (ref, rawBody, err).
+// Tests inject a fake here instead of a real Paystack client.
+type TransferFn func(ctx context.Context, idempotencyKey string) (ref string, rawBody json.RawMessage, err error)
+
+// TestEngine is the engine with injectable dependencies for unit testing.
+type TestEngine struct {
+	queue    QueueWriter
+	idem     IdemCache
+	transfer TransferFn
+}
+
+// PermanentErrorForTest is exported so test files can construct it.
+type PermanentErrorForTest struct {
+	Code int
+}
+
+func (e *PermanentErrorForTest) Error() string {
+	return fmt.Sprintf("permanent error %d", e.Code)
+}
+
+// NewForTest constructs a TestEngine with injected fakes.
+func NewForTest(q QueueWriter, idem IdemCache, transfer TransferFn) *TestEngine {
+	return &TestEngine{queue: q, idem: idem, transfer: transfer}
+}
+
+// ProcessForTest exposes process() for test packages.
+func (e *TestEngine) ProcessForTest(ctx context.Context, txn *models.Transaction) {
+	log := slog.With("txn_id", txn.ID, "attempt", txn.Attempts)
+
+	e.queue.MarkProcessing(ctx, txn.ID.String())
+
+	// Check idempotency cache first
+	cached, err := e.idem.Get(ctx, txn.IdempotencyKey)
+	if err != nil {
+		log.Warn("idempotency cache read error", "error", err)
+	}
+	if cached != nil {
+		log.Info("idempotency cache hit")
+		e.queue.MarkSuccess(ctx, txn.ID.String(), "cached")
+		return
+	}
+
+	// Call the injected transfer function
+	ref, rawBody, err := e.transfer(ctx, txn.IdempotencyKey)
+	if err != nil {
+		var permErr *PermanentErrorForTest
+		isPermanent := errors.As(err, &permErr)
+
+		if isPermanent || txn.Attempts >= txn.MaxAttempts {
+			e.queue.MarkFailed(ctx, txn.ID.String(), err.Error())
+			return
+		}
+		e.queue.MarkRetry(ctx, txn.ID.String(), txn.Attempts, err.Error())
+		return
+	}
+
+	if rawBody != nil {
+		e.idem.Set(ctx, txn.IdempotencyKey, rawBody)
+	}
+	e.queue.MarkSuccess(ctx, txn.ID.String(), ref)
 }
