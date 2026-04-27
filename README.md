@@ -127,3 +127,31 @@ Sync engine (background, 5 workers, polls every 3s):
 ```
 
 ---
+
+```mermaid
+flowchart TD
+    A[User initiates payment] --> B[Generate txn ID - UUID]
+    B --> C[Write to DB - status: pending]
+    C --> D[Update UI - pending]
+    D --> E[Add to persistent queue]
+    E --> F{Network available?}
+    F -->|No| G[Keep in queue]
+    G --> H[Wait for reconnection]
+    H --> F
+    F -->|Yes| I[Sync engine picks up pending txns]
+    I --> J[Attach idempotency key]
+    J --> K[Send payment request to server]
+    K --> L{Idempotency key seen before?}
+    L -->|Yes| M[Return cached result - no duplicate charge]
+    L -->|No| N[Process payment]
+    N --> O[Debit sender]
+    O --> P[Credit receiver]
+    P --> Q[Save txn in DB - status: processing]
+    Q --> R[Send response to client]
+    M --> R
+    R --> S{Request failed?}
+    S -->|Yes| T[Retry with exponential backoff]
+    T --> J
+    S -->|No| U[Update DB - status: success]
+    U --> V[Update UI - success]
+```
